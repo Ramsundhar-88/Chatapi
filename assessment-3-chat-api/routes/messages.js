@@ -1,360 +1,250 @@
 const express = require('express');
-const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
-const crypto = require('crypto');
+
+const config = require('../config');
+const messages = require('../data/messages');
+const rooms = require('../data/rooms');
+const { requireAuth } = require('../middleware/auth');
+const { validateMessage, validateRoomId, validateMessageId, sanitizePagination } = require('../middleware/validation');
+const { messageLimiter } = require('../middleware/rateLimit');
+const { sanitizeMessage, sanitizeRoom, parsePagination } = require('../utils/helpers');
 
 const router = express.Router();
 
-// In-memory storage for messages and rooms
-let messages = [
-  {
-    id: '1',
-    roomId: 'general',
-    userId: 'user1',
-    username: 'alice',
-    content: 'Welcome to the chat!',
-    timestamp: new Date('2024-01-01T10:00:00Z').toISOString(),
-    edited: false,
-    deleted: false
-  },
-  {
-    id: '2', 
-    roomId: 'general',
-    userId: 'user2',
-    username: 'bob',
-    content: 'Hello everyone!',
-    timestamp: new Date('2024-01-01T10:01:00Z').toISOString(),
-    edited: false,
-    deleted: false
-  },
-  {
-    id: '3',
-    roomId: 'private',
-    userId: 'user1',
-    username: 'alice',
-    content: 'This is a private message',
-    timestamp: new Date('2024-01-01T10:02:00Z').toISOString(),
-    edited: false,
-    deleted: false
-  }
-];
-
-const chatRooms = [
-  {
-    id: 'general',
-    name: 'General Chat',
-    type: 'public',
-    createdBy: 'admin',
-    members: ['user1', 'user2', 'user3'],
-    createdAt: new Date('2024-01-01').toISOString()
-  },
-  {
-    id: 'private',
-    name: 'Private Room',
-    type: 'private',
-    createdBy: 'user1',
-    members: ['user1'],
-    createdAt: new Date('2024-01-01').toISOString()
-  }
-];
-
-const JWT_SECRET = 'chat-secret-2024'; // BUG: Hardcoded secret again
-
-// BUG: Inconsistent authentication - sometimes checking, sometimes not
-function getCurrentUser(req) {
-  const authHeader = req.get('authorization');
-  let currentUser = null;
-  
-  if (authHeader) {
-    try {
-      const token = authHeader.split(' ')[1];
-      currentUser = jwt.verify(token, JWT_SECRET);
-    } catch (e) {
-      // BUG: Silently failing authentication instead of returning error
-      console.log('Auth failed:', e.message);
-    }
-  }
-  return currentUser;
-}
-
-// Get all rooms
-router.get('/', async (req, res) => {
+// Get all rooms - requires authentication
+router.get('/', requireAuth, async (req, res) => {
   try {
-    const currentUser = getCurrentUser(req);
+    const allRooms = rooms.getAllRooms();
+    const userId = req.user.userId;
     
-    // BUG: No authentication check - anyone can see all rooms
     res.set({
-      'X-Total-Rooms': chatRooms.length.toString(),
-      'X-Hidden-Command': '/whisper <message> for secret messages'
+      'X-Total-Rooms': allRooms.length.toString()
     });
 
     res.json({
-      rooms: chatRooms.map(room => ({
-        id: room.id,
-        name: room.name,
-        type: room.type,
-        memberCount: room.members.length,
-        // BUG: Exposing member list without permission check
-        members: room.members,
-        createdAt: room.createdAt
-      }))
+      rooms: allRooms.map(room => {
+        const isMember = rooms.isMember(room.id, userId);
+        return sanitizeRoom(room, isMember);
+      })
     });
   } catch (error) {
-    res.status(500).json({ 
-      error: 'Internal server error',
-      // BUG: Exposing internal error details
-      message: error.message
-    });
+    console.error('Get rooms error:', error.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Get messages from room
-router.get('/:roomId', async (req, res) => {
+// Get messages from room - requires authentication
+router.get('/:roomId', validateRoomId, sanitizePagination, requireAuth, async (req, res) => {
   try {
     const { roomId } = req.params;
-    const currentUser = getCurrentUser(req);
+    const userId = req.user.userId;
     
-    const room = chatRooms.find(r => r.id === roomId);
+    const room = rooms.findById(roomId);
     
     if (!room) {
       return res.status(404).json({ error: 'Room not found' });
     }
 
-    // BUG: No room membership check - anyone can read any room's messages
-    if (room.type === 'private' && currentUser && !room.members.includes(currentUser.userId)) {
-      // This check exists but is not properly enforced above
+    // Check room access for private rooms
+    if (room.type === 'private' && !rooms.canAccess(roomId, userId)) {
       return res.status(403).json({ error: 'Access denied to private room' });
     }
 
-    const roomMessages = messages.filter(m => m.roomId === roomId && !m.deleted);
+    // Get pagination
+    const { limit, offset } = parsePagination(req.query, config.pagination);
     
-    // BUG: No pagination for messages - could return thousands of messages
-    const limit = parseInt(req.query.limit) || 1000; // BUG: Very high default limit
-    const offset = parseInt(req.query.offset) || 0;
+    // Get messages
+    const result = messages.getByRoom(roomId, { limit, offset });
     
-    // BUG: Inefficient pagination
-    const paginatedMessages = roomMessages.slice(offset, offset + limit);
-
     res.set({
-      'X-Message-Count': roomMessages.length.toString(),
+      'X-Message-Count': result.total.toString(),
       'X-Room-Type': room.type
     });
 
     res.json({
-      messages: paginatedMessages.map(msg => ({
-        id: msg.id,
-        content: msg.content,
-        username: msg.username,
-        userId: msg.userId, // BUG: Exposing user IDs
-        timestamp: msg.timestamp,
-        edited: msg.edited,
-        // BUG: Exposing edit history without permission
-        editHistory: msg.editHistory || []
-      })),
-      room: {
-        id: room.id,
-        name: room.name,
-        type: room.type
-      },
+      messages: result.messages.map(msg => {
+        const isOwner = msg.userId === userId;
+        return sanitizeMessage(msg, isOwner);
+      }),
+      room: sanitizeRoom(room, rooms.isMember(roomId, userId)),
       pagination: {
         offset,
         limit,
-        total: roomMessages.length
+        total: result.total
       }
     });
   } catch (error) {
-    res.status(500).json({ 
-      error: 'Internal server error',
-      message: error.message
-    });
+    console.error('Get messages error:', error.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Get specific message
-router.get('/:roomId/:messageId', async (req, res) => {
+// Get specific message - requires authentication
+router.get('/:roomId/:messageId', validateRoomId, validateMessageId, requireAuth, async (req, res) => {
   try {
     const { roomId, messageId } = req.params;
-    const currentUser = getCurrentUser(req);
+    const userId = req.user.userId;
     
-    const message = messages.find(m => m.id === messageId && m.roomId === roomId && !m.deleted);
+    const room = rooms.findById(roomId);
+    
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+
+    // Check room access for private rooms
+    if (room.type === 'private' && !rooms.canAccess(roomId, userId)) {
+      return res.status(403).json({ error: 'Access denied to private room' });
+    }
+
+    const message = messages.findById(messageId, roomId);
     
     if (!message) {
       return res.status(404).json({ error: 'Message not found' });
     }
 
-    // BUG: No permission check to view specific message
-    res.json({
-      id: message.id,
-      content: message.content,
-      username: message.username,
-      userId: message.userId, // BUG: Always exposing user ID
-      timestamp: message.timestamp,
-      edited: message.edited,
-      editHistory: message.editHistory || [] // BUG: Always showing edit history
-    });
+    const isOwner = message.userId === userId;
+    res.json(sanitizeMessage(message, isOwner));
   } catch (error) {
-    res.status(500).json({ 
-      error: 'Internal server error',
-      message: error.message
-    });
+    console.error('Get message error:', error.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Send message to room
-router.post('/:roomId', async (req, res) => {
+router.post('/:roomId', requireAuth, validateRoomId, validateMessage, messageLimiter, async (req, res) => {
   try {
     const { roomId } = req.params;
     const { content } = req.body;
-    const currentUser = getCurrentUser(req);
-    
-    // BUG: Not properly checking authentication
-    if (!currentUser) {
-      // This should return error but logic continues
-      console.log('Unauthenticated message send attempt');
-    }
-    
-    if (!content || content.trim() === '') {
-      return res.status(400).json({ error: 'Message content is required' });
-    }
+    const { userId, username } = req.user;
 
-    const room = chatRooms.find(r => r.id === roomId);
+    const room = rooms.findById(roomId);
     if (!room) {
       return res.status(404).json({ error: 'Room not found' });
     }
 
-    // BUG: No room membership check for sending messages
+    // Check room access
+    if (!rooms.canAccess(roomId, userId)) {
+      return res.status(403).json({ error: 'You are not a member of this room' });
+    }
     
-    const newMessage = {
+    const newMessage = messages.createMessage({
       id: uuidv4(),
       roomId,
-      userId: currentUser ? currentUser.userId : 'anonymous', // BUG: Allowing anonymous messages
-      username: currentUser ? currentUser.username : 'Anonymous',
-      content: content.trim(),
-      timestamp: new Date().toISOString(),
-      edited: false,
-      deleted: false
-    };
-
-    messages.push(newMessage);
+      userId,
+      username,
+      content
+    });
 
     res.set('X-Message-Id', newMessage.id);
 
     res.status(201).json({
       message: 'Message sent successfully',
-      messageData: {
-        id: newMessage.id,
-        content: newMessage.content,
-        username: newMessage.username,
-        timestamp: newMessage.timestamp
-      }
+      messageData: sanitizeMessage(newMessage, true)
     });
   } catch (error) {
-    res.status(500).json({ 
-      error: 'Internal server error',
-      message: error.message
-    });
+    console.error('Send message error:', error.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Edit message
-router.put('/:roomId/:messageId', async (req, res) => {
+router.put('/:roomId/:messageId', requireAuth, validateRoomId, validateMessageId, validateMessage, async (req, res) => {
   try {
     const { roomId, messageId } = req.params;
     const { content } = req.body;
-    const currentUser = getCurrentUser(req);
+    const { userId } = req.user;
 
-    if (!currentUser) {
-      return res.status(401).json({ error: 'Authentication required' });
+    const room = rooms.findById(roomId);
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
     }
 
-    const messageIndex = messages.findIndex(m => m.id === messageId && m.roomId === roomId && !m.deleted);
-    
-    if (messageIndex === -1) {
+    const message = messages.findById(messageId, roomId);
+    if (!message) {
       return res.status(404).json({ error: 'Message not found' });
     }
 
-    const message = messages[messageIndex];
-    
-    // BUG: Not checking if user owns the message
-    if (message.userId !== currentUser.userId) {
-      // This check exists but doesn't return early - bug continues execution
-      console.log('User trying to edit message they do not own');
-    }
-    
-    if (!content || content.trim() === '') {
-      return res.status(400).json({ error: 'Message content is required' });
+    // Check ownership - only message owner can edit
+    if (!messages.isOwner(messageId, userId)) {
+      return res.status(403).json({ error: 'You can only edit your own messages' });
     }
 
-    // BUG: Not storing edit history properly
-    if (!message.editHistory) {
-      message.editHistory = [];
-    }
-    
-    message.editHistory.push({
-      previousContent: message.content,
-      editedAt: new Date().toISOString(),
-      editedBy: currentUser.userId
-    });
-
-    message.content = content.trim();
-    message.edited = true;
-    message.lastEditedAt = new Date().toISOString();
+    const updatedMessage = messages.updateMessage(messageId, content, userId);
 
     res.json({
       message: 'Message updated successfully',
-      messageData: {
-        id: message.id,
-        content: message.content,
-        edited: message.edited,
-        lastEditedAt: message.lastEditedAt
-      }
+      messageData: sanitizeMessage(updatedMessage, true)
     });
   } catch (error) {
-    res.status(500).json({ 
-      error: 'Internal server error',
-      message: error.message
-    });
+    console.error('Edit message error:', error.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Delete message
-router.delete('/:roomId/:messageId', async (req, res) => {
+router.delete('/:roomId/:messageId', requireAuth, validateRoomId, validateMessageId, async (req, res) => {
   try {
     const { roomId, messageId } = req.params;
-    const currentUser = getCurrentUser(req);
+    const { userId, role } = req.user;
 
-    if (!currentUser) {
-      return res.status(401).json({ error: 'Authentication required' });
+    const room = rooms.findById(roomId);
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
     }
 
-    const messageIndex = messages.findIndex(m => m.id === messageId && m.roomId === roomId && !m.deleted);
-    
-    if (messageIndex === -1) {
+    const message = messages.findById(messageId, roomId);
+    if (!message) {
       return res.status(404).json({ error: 'Message not found' });
     }
 
-    const message = messages[messageIndex];
+    // Check permissions: owner, room owner, or admin/moderator
+    const isMessageOwner = messages.isOwner(messageId, userId);
+    const isRoomOwner = rooms.isOwner(roomId, userId);
+    const isAdminOrMod = role === 'admin' || role === 'moderator';
     
-    // BUG: Same ownership check issue
-    const room = chatRooms.find(r => r.id === roomId);
-    const isRoomOwner = room && room.createdBy === currentUser.userId;
-    const isMessageOwner = message.userId === currentUser.userId;
-    
-    if (!isRoomOwner && !isMessageOwner) {
+    if (!isMessageOwner && !isRoomOwner && !isAdminOrMod) {
       return res.status(403).json({ error: 'Permission denied' });
     }
 
-    // BUG: Soft delete but not hiding from other endpoints
-    message.deleted = true;
-    message.deletedAt = new Date().toISOString();
-    message.deletedBy = currentUser.userId;
+    messages.deleteMessage(messageId, userId);
 
     res.json({ message: 'Message deleted successfully' });
   } catch (error) {
-    res.status(500).json({ 
-      error: 'Internal server error',
-      message: error.message
+    console.error('Delete message error:', error.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Search messages
+router.get('/search', requireAuth, async (req, res) => {
+  try {
+    const { q, roomId } = req.query;
+    const { userId } = req.user;
+
+    if (!q || q.trim() === '') {
+      return res.status(400).json({ error: 'Search query is required' });
+    }
+
+    // If room specified, check access
+    if (roomId) {
+      const room = rooms.findById(roomId);
+      if (!room) {
+        return res.status(404).json({ error: 'Room not found' });
+      }
+      if (!rooms.canAccess(roomId, userId)) {
+        return res.status(403).json({ error: 'Access denied to this room' });
+      }
+    }
+
+    const results = messages.searchMessages(q.trim(), roomId);
+
+    res.json({
+      results: results.map(msg => sanitizeMessage(msg, msg.userId === userId)),
+      total: results.length
     });
+  } catch (error) {
+    console.error('Search messages error:', error.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 

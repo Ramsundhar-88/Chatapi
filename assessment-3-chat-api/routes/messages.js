@@ -11,6 +11,39 @@ const { sanitizeMessage, sanitizeRoom, parsePagination } = require('../utils/hel
 
 const router = express.Router();
 
+// Search messages - MUST be defined before /:roomId to avoid route collision
+router.get('/search', requireAuth, async (req, res) => {
+  try {
+    const { q, roomId } = req.query;
+    const { userId } = req.user;
+
+    if (!q || q.trim() === '') {
+      return res.status(400).json({ error: 'Search query is required' });
+    }
+
+    // If room specified, check access
+    if (roomId) {
+      const room = rooms.findById(roomId);
+      if (!room) {
+        return res.status(404).json({ error: 'Room not found' });
+      }
+      if (!rooms.canAccess(roomId, userId)) {
+        return res.status(403).json({ error: 'Access denied to this room' });
+      }
+    }
+
+    const results = messages.searchMessages(q.trim(), roomId);
+
+    res.json({
+      results: results.map(msg => sanitizeMessage(msg, msg.userId === userId)),
+      total: results.length
+    });
+  } catch (error) {
+    console.error('Search messages error:', error.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Get all rooms - requires authentication
 router.get('/', requireAuth, async (req, res) => {
   try {
@@ -211,39 +244,6 @@ router.delete('/:roomId/:messageId', requireAuth, validateRoomId, validateMessag
     res.json({ message: 'Message deleted successfully' });
   } catch (error) {
     console.error('Delete message error:', error.message);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Search messages
-router.get('/search', requireAuth, async (req, res) => {
-  try {
-    const { q, roomId } = req.query;
-    const { userId } = req.user;
-
-    if (!q || q.trim() === '') {
-      return res.status(400).json({ error: 'Search query is required' });
-    }
-
-    // If room specified, check access
-    if (roomId) {
-      const room = rooms.findById(roomId);
-      if (!room) {
-        return res.status(404).json({ error: 'Room not found' });
-      }
-      if (!rooms.canAccess(roomId, userId)) {
-        return res.status(403).json({ error: 'Access denied to this room' });
-      }
-    }
-
-    const results = messages.searchMessages(q.trim(), roomId);
-
-    res.json({
-      results: results.map(msg => sanitizeMessage(msg, msg.userId === userId)),
-      total: results.length
-    });
-  } catch (error) {
-    console.error('Search messages error:', error.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

@@ -348,3 +348,22 @@ Document your approach to solving complex security issues and real-time challeng
 - WebSocket connection handling
 - Message delivery guarantees
 - Security threat modeling
+
+
+
+---
+
+## 🔐 Security Fixes Implemented
+
+This section documents the security vulnerabilities identified in the original
+assessment and the solutions implemented. See SECURITY_FIXES.md for details.
+
+## 🧪 Testing
+
+All endpoints were manually tested using curl and Postman.
+See TESTING.md for detailed scenarios.
+
+## 🎥 Video Walkthrough
+
+A short video walkthrough explaining the design decisions and fixes is included
+with the submission.
